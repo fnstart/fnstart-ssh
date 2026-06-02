@@ -1,0 +1,27 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "commonjs",
+		"moduleResolution": "node",
+		"lib": ["ES2022"],
+		"types": ["bun", "node"],
+
+		"rootDir": "src",
+		"outDir": "lib",
+
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
+		"skipLibCheck": true,
+		"resolveJsonModule": true,
+		"isolatedModules": true,
+		"forceConsistentCasingInFileNames": true,
+
+		"strict": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+
+		"declaration": true,
+		"pretty": true
+	},
+	"include": ["src/**/*"]
+}
