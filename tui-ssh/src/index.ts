@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import * as pty from "node-pty";
+
 import { Server, type ServerChannel } from "ssh2";
 
 const PORT = Number(process.env.PORT) || 2222;
@@ -61,26 +61,6 @@ function safeWrite(stream: ServerChannel, data: string): boolean {
   }
 }
 
-function ptyWrite(proc: pty.IPty | undefined, data: string): void {
-  if (!proc) return;
-  if (!IS_WINDOWS) {
-    try {
-      proc.write(data);
-    } catch {}
-    return;
-  }
-  const fd = (proc as any)._agent?._inSocketFD;
-  if (fd != null && fd >= 0) {
-    try {
-      fs.writeSync(fd, data);
-    } catch {}
-    return;
-  }
-  try {
-    proc.write(data);
-  } catch {}
-}
-
 function clampTerm(term?: string): string {
   const t = (term || DEFAULT_TERM).trim();
   if (!t) return DEFAULT_TERM;
@@ -97,16 +77,16 @@ function clampSize(
   return Math.max(min, Math.min(max, Math.floor(Number(n))));
 }
 
-function buildSpawnSpec(cmd: string, args: string[], cwd: string) {
+function buildCommandAndArgs(cmd: string, args: string[], cwd: string) {
   if (IS_WINDOWS) {
     const shell = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
     const command = [cmd, ...args].join(" ");
-    return { file: shell, args: ["/d", "/s", "/c", command], cwd };
+    return { command: shell, args: ["/d", "/s", "/c", command], cwd };
   }
   const shell = process.env.SHELL || "/bin/bash";
   const command = [cmd, ...args].join(" ");
   return {
-    file: shell,
+    command: shell,
     args: ["-lc", `cd ${JSON.stringify(cwd)} && ${command}`],
     cwd: "/",
   };
@@ -164,7 +144,7 @@ const server = new Server(
         let term = DEFAULT_TERM;
         let cols = 80;
         let rows = 24;
-        let proc: pty.IPty | undefined;
+        let proc: any;
         let dead = false;
         let idleTimer: NodeJS.Timeout | undefined;
         let currentStream: ServerChannel | undefined;
@@ -208,9 +188,9 @@ const server = new Server(
         session.on("window-change", (accept, _reject, info) => {
           cols = clampSize(info.cols, cols, 20, 500);
           rows = clampSize(info.rows, rows, 5, 200);
-          if (proc && !dead) {
+          bail: if (proc) {
             try {
-              proc.resize(cols, rows);
+              proc.resize({ cols, rows });
             } catch {}
           }
           bumpIdle();
@@ -221,9 +201,9 @@ const server = new Server(
           const stream = acceptShell();
           currentStream = stream;
 
-          const spawnSpec = buildSpawnSpec(TUI_CMD, TUI_ARGS, TUI_DIR);
+          const spec = buildCommandAndArgs(TUI_CMD, TUI_ARGS, TUI_DIR);
           console.log(
-            `[ssh:${cid}] shell ${spawnSpec.file} ${spawnSpec.args.join(" ")} @ ${cols}x${rows}`,
+            `[ssh:${cid}] shell ${spec.command} ${spec.args.join(" ")} @ ${cols}x${rows}`,
           );
 
           stream.on("error", (err: Error) => {
@@ -236,11 +216,8 @@ const server = new Server(
             cleanup();
           });
 
-          proc = pty.spawn(spawnSpec.file, spawnSpec.args, {
-            name: term,
-            cols,
-            rows,
-            cwd: spawnSpec.cwd,
+          proc = Bun.spawn([spec.command, ...spec.args], {
+            cwd: spec.cwd,
             env: {
               ...process.env,
               TERM: term,
@@ -249,14 +226,23 @@ const server = new Server(
               HOME: DEFAULT_HOME,
               PATH: DEFAULT_PATH,
               SSH_SESSION: cid,
-            } as { [k: string]: string },
+            },
+            pty: {
+              cols,
+              rows,
+              name: term,
+            },
+            onExit() {
+              console.log(`[ssh:${cid}] pty exit`);
+              cleanup();
+              try {
+                stream.exit(0);
+                stream.end();
+              } catch {}
+            },
           });
 
-          const agent = (proc as any)._agent;
-          if (agent?.inSocket) agent.inSocket.on("error", () => {});
-          if (agent?.outSocket) agent.outSocket.on("error", () => {});
-          (proc as any).on?.("error", () => {});
-
+          // Pipe stdout -> SSH
           let buffered = 0;
           const pending: string[] = [];
           let draining = false;
@@ -281,11 +267,12 @@ const server = new Server(
             flush();
           });
 
-          proc.onData((d) => {
-            if (dead) return;
+          for (const chunk of proc.stdout) {
+            if (dead) break;
+            const d = chunk.toString();
             bumpIdle();
             if (!draining && pending.length === 0) {
-              if (safeWrite(stream, d)) return;
+              if (safeWrite(stream, d)) continue;
               draining = true;
               stream.once("drain", () => {
                 draining = false;
@@ -301,12 +288,13 @@ const server = new Server(
               try {
                 stream.end();
               } catch {}
-              return;
+              break;
             }
             pending.push(d);
             buffered += sz;
-          });
+          }
 
+          // Pipe SSH -> stdin
           stream.on("data", (d: Buffer) => {
             if (dead) return;
             bumpIdle();
@@ -320,19 +308,12 @@ const server = new Server(
               } catch {}
               return;
             }
-            ptyWrite(proc, d.toString("utf8"));
+            try {
+              proc.stdin.write(d);
+            } catch {}
           });
 
           bumpIdle();
-
-          proc.onExit(({ exitCode }) => {
-            console.log(`[ssh:${cid}] pty exit ${exitCode}`);
-            cleanup();
-            try {
-              stream.exit(exitCode);
-              stream.end();
-            } catch {}
-          });
         });
 
         session.on("exec", (_acceptExec, rejectExec) => {
