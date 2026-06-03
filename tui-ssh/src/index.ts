@@ -1,19 +1,92 @@
+// Bun-only server. Must be launched with `bun`, NOT `node`.
+// Fails loudly below if Bun is missing so you don't get a silent no-op on the server.
+declare const Bun: any;
+if (typeof Bun === "undefined") {
+  // This is the #1 "works locally, dead on Ubuntu" cause: the service/Docker/systemd
+  // entrypoint runs `node dist/...` instead of `bun src/...`.
+  console.error(
+    "[ssh] FATAL: this server requires Bun (uses Bun.spawn + pty). " +
+      "Launch it with `bun <thisfile>` — not node.",
+  );
+  process.exit(1);
+}
+
 import * as crypto from "crypto";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 
 import { Server, type ServerChannel } from "ssh2";
 
 const PORT = Number(process.env.PORT) || 2222;
 const HOST = process.env.HOST || "0.0.0.0";
-const TUI_DIR =
-  process.env.TUI_DIR || path.resolve(__dirname, "..", "..", "tui-rezi");
+
+// ---- TUI_DIR resolution -------------------------------------------------
+// On a server, __dirname after a build/deploy rarely matches dev layout, so the
+// old `../../tui-rezi` default silently pointed at a nonexistent path and the
+// process exited immediately. Try several candidates and let env override win.
+function resolveTuiDir(): string {
+  if (process.env.TUI_DIR) return path.resolve(process.env.TUI_DIR);
+  const candidates = [
+    path.resolve(__dirname, "..", "..", "tui-rezi"),
+    path.resolve(__dirname, "..", "tui-rezi"),
+    path.resolve(__dirname, "tui-rezi"),
+    path.resolve(process.cwd(), "tui-rezi"),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return candidates[0]; // fall through; existence is checked below with a clear error
+}
+
+const TUI_DIR = resolveTuiDir();
 const TUI_CMD = process.env.TUI_CMD || process.execPath;
 const TUI_ARGS = (process.env.TUI_ARGS || "src/main/App.tsx")
   .split(" ")
   .filter(Boolean);
-const HOST_KEY_PATH =
-  process.env.SSH_HOST_KEY || path.resolve(__dirname, "..", "host.key");
+
+const IS_WINDOWS = process.platform === "win32";
+
+// ---- Writable HOME ------------------------------------------------------
+// /var/lib/tuissh usually does NOT exist on a fresh Ubuntu box. Ensure a usable,
+// writable HOME or fall back to a temp dir so the shell/TUI can write its config.
+function ensureWritableDir(dir: string): boolean {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveHome(): string {
+  const preferred =
+    process.env.HOME ||
+    (IS_WINDOWS ? process.env.USERPROFILE || "C:\\" : "/var/lib/tuissh");
+  if (ensureWritableDir(preferred)) return preferred;
+  const fallback = path.join(os.tmpdir(), "tuissh-home");
+  if (ensureWritableDir(fallback)) {
+    console.warn(`[ssh] HOME ${preferred} not writable -> using ${fallback}`);
+    return fallback;
+  }
+  return os.tmpdir();
+}
+
+const DEFAULT_TERM = process.env.TUI_TERM || "xterm-256color";
+const DEFAULT_HOME = resolveHome();
+const DEFAULT_PATH =
+  process.env.PATH ||
+  (IS_WINDOWS
+    ? "C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Git\\bin"
+    : "/usr/local/bin:/usr/bin:/bin");
+
+// ---- Host key (writable path + dir creation) ----------------------------
+const HOST_KEY_PATH = (() => {
+  const p =
+    process.env.SSH_HOST_KEY || path.resolve(__dirname, "..", "host.key");
+  return p;
+})();
 
 const MAX_PER_IP = 3;
 const MAX_TOTAL = 100;
@@ -21,22 +94,19 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_BUFFER = 1 << 20;
 
-const IS_WINDOWS = process.platform === "win32";
-const DEFAULT_TERM = process.env.TUI_TERM || "xterm-256color";
-const DEFAULT_HOME =
-  process.env.HOME ||
-  (IS_WINDOWS ? process.env.USERPROFILE || "C:\\" : "/var/lib/tuissh");
-const DEFAULT_PATH =
-  process.env.PATH ||
-  (IS_WINDOWS
-    ? "C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Git\\bin"
-    : "/usr/local/bin:/usr/bin:/bin");
-
 const perIp = new Map<string, number>();
 let total = 0;
 
 function loadOrGenerateHostKey(): Buffer {
   if (fs.existsSync(HOST_KEY_PATH)) return fs.readFileSync(HOST_KEY_PATH);
+  const dir = path.dirname(HOST_KEY_PATH);
+  if (!ensureWritableDir(dir)) {
+    console.error(
+      `[ssh] FATAL: host key dir not writable: ${dir}. ` +
+        `Set SSH_HOST_KEY to a writable absolute path (e.g. /var/lib/tuissh/host.key).`,
+    );
+    process.exit(1);
+  }
   const { privateKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
     publicKeyEncoding: { type: "spki", format: "pem" },
@@ -48,7 +118,10 @@ function loadOrGenerateHostKey(): Buffer {
 }
 
 if (!fs.existsSync(TUI_DIR)) {
-  console.error(`[ssh] TUI_DIR does not exist: ${TUI_DIR}`);
+  console.error(
+    `[ssh] FATAL: TUI_DIR does not exist: ${TUI_DIR}. ` +
+      `Set TUI_DIR to the absolute path of your tui-rezi directory.`,
+  );
   process.exit(1);
 }
 
@@ -85,9 +158,12 @@ function buildCommandAndArgs(cmd: string, args: string[], cwd: string) {
   }
   const shell = process.env.SHELL || "/bin/bash";
   const command = [cmd, ...args].join(" ");
+  // NOTE: use `-c`, not `-lc`. A login shell sources /etc/profile + MOTD on a
+  // server and dumps that text straight into the PTY, corrupting the TUI's first
+  // paint and making it look broken even when it started fine.
   return {
     command: shell,
-    args: ["-lc", `cd ${JSON.stringify(cwd)} && ${command}`],
+    args: ["-c", `cd ${JSON.stringify(cwd)} && ${command}`],
     cwd: "/",
   };
 }
@@ -188,7 +264,7 @@ const server = new Server(
         session.on("window-change", (accept, _reject, info) => {
           cols = clampSize(info.cols, cols, 20, 500);
           rows = clampSize(info.rows, rows, 5, 200);
-          bail: if (proc) {
+          if (proc) {
             try {
               proc.resize({ cols, rows });
             } catch {}
@@ -267,32 +343,37 @@ const server = new Server(
             flush();
           });
 
-          for (const chunk of proc.stdout) {
-            if (dead) break;
-            const d = chunk.toString();
-            bumpIdle();
-            if (!draining && pending.length === 0) {
-              if (safeWrite(stream, d)) continue;
-              draining = true;
-              stream.once("drain", () => {
-                draining = false;
-                flush();
-              });
+          (async () => {
+            for await (const chunk of proc.stdout) {
+              if (dead) break;
+              const d = chunk.toString();
+              bumpIdle();
+              if (!draining && pending.length === 0) {
+                if (safeWrite(stream, d)) continue;
+                draining = true;
+                stream.once("drain", () => {
+                  draining = false;
+                  flush();
+                });
+              }
+              const sz = Buffer.byteLength(d, "utf8");
+              if (buffered + sz > MAX_BUFFER) {
+                console.log(
+                  `[ssh:${cid}] backpressure overflow (>${MAX_BUFFER}B), killing`,
+                );
+                cleanup();
+                try {
+                  stream.end();
+                } catch {}
+                break;
+              }
+              pending.push(d);
+              buffered += sz;
             }
-            const sz = Buffer.byteLength(d, "utf8");
-            if (buffered + sz > MAX_BUFFER) {
-              console.log(
-                `[ssh:${cid}] backpressure overflow (>${MAX_BUFFER}B), killing`,
-              );
-              cleanup();
-              try {
-                stream.end();
-              } catch {}
-              break;
-            }
-            pending.push(d);
-            buffered += sz;
-          }
+          })().catch((err) => {
+            console.log(`[ssh:${cid}] stdout pump error: ${err?.message}`);
+            cleanup();
+          });
 
           // Pipe SSH -> stdin
           stream.on("data", (d: Buffer) => {
@@ -334,6 +415,9 @@ const server = new Server(
 
 server.listen(PORT, HOST, () => {
   console.log(`[ssh] listening ${HOST}:${PORT}`);
+  console.log(`[ssh] TUI_DIR=${TUI_DIR}`);
+  console.log(`[ssh] HOME=${DEFAULT_HOME}`);
+  console.log(`[ssh] HOST_KEY=${HOST_KEY_PATH}`);
   console.log(`[ssh] try: ssh -p ${PORT} localhost`);
 });
 
