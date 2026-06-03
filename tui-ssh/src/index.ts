@@ -9,7 +9,9 @@ const HOST = process.env.HOST || "0.0.0.0";
 const TUI_DIR =
   process.env.TUI_DIR || path.resolve(__dirname, "..", "..", "tui-rezi");
 const TUI_CMD = process.env.TUI_CMD || process.execPath;
-const TUI_ARGS = (process.env.TUI_ARGS || "src/main/App.tsx").split(" ");
+const TUI_ARGS = (process.env.TUI_ARGS || "src/main/App.tsx")
+  .split(" ")
+  .filter(Boolean);
 const HOST_KEY_PATH =
   process.env.SSH_HOST_KEY || path.resolve(__dirname, "..", "host.key");
 
@@ -17,15 +19,24 @@ const MAX_PER_IP = 3;
 const MAX_TOTAL = 100;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_BUFFER = 1 << 20; // 1 MiB
+const MAX_BUFFER = 1 << 20;
+
+const IS_WINDOWS = process.platform === "win32";
+const DEFAULT_TERM = process.env.TUI_TERM || "xterm-256color";
+const DEFAULT_HOME =
+  process.env.HOME ||
+  (IS_WINDOWS ? process.env.USERPROFILE || "C:\\" : "/var/lib/tuissh");
+const DEFAULT_PATH =
+  process.env.PATH ||
+  (IS_WINDOWS
+    ? "C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\Git\\bin"
+    : "/usr/local/bin:/usr/bin:/bin");
 
 const perIp = new Map<string, number>();
 let total = 0;
 
 function loadOrGenerateHostKey(): Buffer {
-  if (fs.existsSync(HOST_KEY_PATH)) {
-    return fs.readFileSync(HOST_KEY_PATH);
-  }
+  if (fs.existsSync(HOST_KEY_PATH)) return fs.readFileSync(HOST_KEY_PATH);
   const { privateKey } = crypto.generateKeyPairSync("rsa", {
     modulusLength: 2048,
     publicKeyEncoding: { type: "spki", format: "pem" },
@@ -50,19 +61,55 @@ function safeWrite(stream: ServerChannel, data: string): boolean {
   }
 }
 
-// Bun's net.Socket({ fd }) doesn't work for ConPTY named pipe FDs on Windows.
-// The socket is created in "pending" state and writes silently go nowhere.
-// Workaround: write directly to the raw FD via fs.writeSync.
-// Requires patched node_modules/node-pty/lib/windowsPtyAgent.js that stores
-// the FD as this._inSocketFD (one-line addition).
-function rawPtyWrite(proc: pty.IPty | undefined, data: string): void {
+function ptyWrite(proc: pty.IPty | undefined, data: string): void {
   if (!proc) return;
+  if (!IS_WINDOWS) {
+    try {
+      proc.write(data);
+    } catch {}
+    return;
+  }
   const fd = (proc as any)._agent?._inSocketFD;
   if (fd != null && fd >= 0) {
     try {
       fs.writeSync(fd, data);
     } catch {}
+    return;
   }
+  try {
+    proc.write(data);
+  } catch {}
+}
+
+function clampTerm(term?: string): string {
+  const t = (term || DEFAULT_TERM).trim();
+  if (!t) return DEFAULT_TERM;
+  return /^[A-Za-z0-9+_.-]{1,64}$/.test(t) ? t : DEFAULT_TERM;
+}
+
+function clampSize(
+  n: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(Number(n))));
+}
+
+function buildSpawnSpec(cmd: string, args: string[], cwd: string) {
+  if (IS_WINDOWS) {
+    const shell = process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe";
+    const command = [cmd, ...args].join(" ");
+    return { file: shell, args: ["/d", "/s", "/c", command], cwd };
+  }
+  const shell = process.env.SHELL || "/bin/bash";
+  const command = [cmd, ...args].join(" ");
+  return {
+    file: shell,
+    args: ["-lc", `cd ${JSON.stringify(cwd)} && ${command}`],
+    cwd: "/",
+  };
 }
 
 const server = new Server(
@@ -77,7 +124,9 @@ const server = new Server(
     const ipCount = perIp.get(ip) ?? 0;
     if (total >= MAX_TOTAL || ipCount >= MAX_PER_IP) {
       console.log(`[ssh:${cid}] reject ${ip} (ip=${ipCount} total=${total})`);
-      try { client.end(); } catch {}
+      try {
+        client.end();
+      } catch {}
       return;
     }
     perIp.set(ip, ipCount + 1);
@@ -95,13 +144,13 @@ const server = new Server(
 
     const handshakeTimer = setTimeout(() => {
       console.log(`[ssh:${cid}] handshake timeout from ${ip}`);
-      try { client.end(); } catch {}
+      try {
+        client.end();
+      } catch {}
     }, HANDSHAKE_TIMEOUT_MS);
 
     client.on("authentication", (ctx) => {
-      if (ctx.method !== "none") {
-        return ctx.reject(["none"], false);
-      }
+      if (ctx.method !== "none") return ctx.reject(["none"], false);
       ctx.accept();
     });
 
@@ -112,7 +161,7 @@ const server = new Server(
       client.on("session", (acceptSession) => {
         const session = acceptSession();
 
-        let term = "xterm-256color";
+        let term = DEFAULT_TERM;
         let cols = 80;
         let rows = 24;
         let proc: pty.IPty | undefined;
@@ -123,12 +172,12 @@ const server = new Server(
         const cleanup = () => {
           if (dead) return;
           dead = true;
-          if (idleTimer) {
-            clearTimeout(idleTimer);
-            idleTimer = undefined;
-          }
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = undefined;
           if (proc) {
-            try { proc.kill(); } catch {}
+            try {
+              proc.kill();
+            } catch {}
             proc = undefined;
           }
         };
@@ -141,23 +190,28 @@ const server = new Server(
             const s = currentStream;
             cleanup();
             if (s) {
-              try { s.exit(0); s.end(); } catch {}
+              try {
+                s.exit(0);
+                s.end();
+              } catch {}
             }
           }, IDLE_TIMEOUT_MS);
         };
 
         session.on("pty", (accept, _reject, info) => {
-          term = (info as { term?: string }).term || term;
-          cols = info.cols || cols;
-          rows = info.rows || rows;
+          term = clampTerm((info as { term?: string }).term);
+          cols = clampSize(info.cols, cols, 20, 500);
+          rows = clampSize(info.rows, rows, 5, 200);
           accept && accept();
         });
 
         session.on("window-change", (accept, _reject, info) => {
-          cols = info.cols;
-          rows = info.rows;
+          cols = clampSize(info.cols, cols, 20, 500);
+          rows = clampSize(info.rows, rows, 5, 200);
           if (proc && !dead) {
-            try { proc.resize(cols, rows); } catch {}
+            try {
+              proc.resize(cols, rows);
+            } catch {}
           }
           bumpIdle();
           accept && accept();
@@ -166,8 +220,10 @@ const server = new Server(
         session.on("shell", (acceptShell) => {
           const stream = acceptShell();
           currentStream = stream;
+
+          const spawnSpec = buildSpawnSpec(TUI_CMD, TUI_ARGS, TUI_DIR);
           console.log(
-            `[ssh:${cid}] shell ${TUI_CMD} ${TUI_ARGS.join(" ")} @ ${cols}x${rows}`,
+            `[ssh:${cid}] shell ${spawnSpec.file} ${spawnSpec.args.join(" ")} @ ${cols}x${rows}`,
           );
 
           stream.on("error", (err: Error) => {
@@ -180,26 +236,25 @@ const server = new Server(
             cleanup();
           });
 
-          proc = pty.spawn(TUI_CMD, TUI_ARGS, {
+          proc = pty.spawn(spawnSpec.file, spawnSpec.args, {
             name: term,
             cols,
             rows,
-            cwd: TUI_DIR,
+            cwd: spawnSpec.cwd,
             env: {
               ...process.env,
               TERM: term,
+              COLORTERM: process.env.COLORTERM || "truecolor",
               FORCE_COLOR: "1",
+              HOME: DEFAULT_HOME,
+              PATH: DEFAULT_PATH,
               SSH_SESSION: cid,
             } as { [k: string]: string },
           });
 
           const agent = (proc as any)._agent;
-          if (agent?.inSocket) {
-            agent.inSocket.on("error", () => {});
-          }
-          if (agent?.outSocket) {
-            agent.outSocket.on("error", () => {});
-          }
+          if (agent?.inSocket) agent.inSocket.on("error", () => {});
+          if (agent?.outSocket) agent.outSocket.on("error", () => {});
           (proc as any).on?.("error", () => {});
 
           let buffered = 0;
@@ -212,13 +267,19 @@ const server = new Server(
               buffered -= Buffer.byteLength(chunk, "utf8");
               if (!safeWrite(stream, chunk)) {
                 draining = true;
-                stream.once("drain", () => { draining = false; flush(); });
+                stream.once("drain", () => {
+                  draining = false;
+                  flush();
+                });
                 return;
               }
             }
           };
 
-          stream.on("drain", () => { draining = false; flush(); });
+          stream.on("drain", () => {
+            draining = false;
+            flush();
+          });
 
           proc.onData((d) => {
             if (dead) return;
@@ -226,13 +287,20 @@ const server = new Server(
             if (!draining && pending.length === 0) {
               if (safeWrite(stream, d)) return;
               draining = true;
-              stream.once("drain", () => { draining = false; flush(); });
+              stream.once("drain", () => {
+                draining = false;
+                flush();
+              });
             }
             const sz = Buffer.byteLength(d, "utf8");
             if (buffered + sz > MAX_BUFFER) {
-              console.log(`[ssh:${cid}] backpressure overflow (>${MAX_BUFFER}B), killing`);
+              console.log(
+                `[ssh:${cid}] backpressure overflow (>${MAX_BUFFER}B), killing`,
+              );
               cleanup();
-              try { stream.end(); } catch {}
+              try {
+                stream.end();
+              } catch {}
               return;
             }
             pending.push(d);
@@ -243,7 +311,6 @@ const server = new Server(
             if (dead) return;
             bumpIdle();
             const buf = Buffer.from(d);
-            // Ctrl+C (0x03) disconnects the session
             if (buf.includes(0x03)) {
               console.log(`[ssh:${cid}] ctrl+c disconnect`);
               cleanup();
@@ -253,7 +320,7 @@ const server = new Server(
               } catch {}
               return;
             }
-            rawPtyWrite(proc, d.toString("utf8"));
+            ptyWrite(proc, d.toString("utf8"));
           });
 
           bumpIdle();
