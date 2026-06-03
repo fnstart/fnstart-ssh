@@ -156,16 +156,16 @@ function buildCommandAndArgs(cmd: string, args: string[], cwd: string) {
     const command = [cmd, ...args].join(" ");
     return { command: shell, args: ["/d", "/s", "/c", command], cwd };
   }
-  const shell = process.env.SHELL || "/bin/bash";
-  const command = [cmd, ...args].join(" ");
-  // NOTE: use `-c`, not `-lc`. A login shell sources /etc/profile + MOTD on a
-  // server and dumps that text straight into the PTY, corrupting the TUI's first
-  // paint and making it look broken even when it started fine.
-  return {
-    command: shell,
-    args: ["-c", `cd ${JSON.stringify(cwd)} && ${command}`],
-    cwd: "/",
-  };
+  // Run the TUI DIRECTLY — no shell wrapper. This is the fix for the server.
+  //  1) The systemd service user is created with `--shell /usr/sbin/nologin`, and
+  //     systemd exports $SHELL=/usr/sbin/nologin into the unit. A shell wrapper
+  //     would launch `/usr/sbin/nologin -lc ...`, which ignores its args, prints
+  //     "This account is currently not available", and exits — so every session
+  //     died on connect. (It worked in local dev only because your interactive
+  //     $SHELL was a real shell.)
+  //  2) No login shell also means no /etc/profile / MOTD leaking into the PTY.
+  // Bun.spawn sets cwd + env itself, so the shell bought nothing here.
+  return { command: cmd, args, cwd };
 }
 
 const server = new Server(
